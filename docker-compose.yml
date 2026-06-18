@@ -4,7 +4,9 @@ services:
     container_name: address-parser
     restart: unless-stopped
     ports:
-      - "8501:8501"         # порт приложения (измените левую часть при необходимости)
+      - "8501:8501" # порт приложения (измените левую часть при необходимости)
+    volumes:
+      - ./logs:/app/logs # журнал использования сохраняется между пересборками
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 30s

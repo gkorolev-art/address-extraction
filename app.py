@@ -1,9 +1,11 @@
 """Main Streamlit app for extracting address fields from Excel files."""
 
+import hashlib
 import io
 import time
 import logging
 import traceback
+import uuid
 from pathlib import Path
 
 import pandas as pd
@@ -11,6 +13,7 @@ import streamlit as st
 
 from parser.address_parser import parse_address, ParsedAddress
 from parser.column_detector import score_all_columns
+from usage_journal import UsageJournal
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,12 +23,39 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────
 
 APP_TITLE   = "TZS address extractor"
-APP_VERSION = "1.13.5"
+APP_VERSION = "1.13.6"
 FAVICON_PATH = Path(__file__).parent / "assets" / "tzs-favicon.svg"
+USAGE_LOG_PATH = Path(__file__).parent / "logs" / "usage.jsonl"
 
 COL_SETTLEMENT  = "Населённый пункт"
 COL_HOUSE_STREET = "Номер дома, улица"
 COL_SOURCE      = "Исходная строка"
+
+try:
+    usage_journal = UsageJournal(USAGE_LOG_PATH)
+except OSError:
+    usage_journal = None
+    logger.exception("Unable to initialize usage journal")
+
+
+def _session_id() -> str:
+    if "_usage_session_id" not in st.session_state:
+        st.session_state["_usage_session_id"] = uuid.uuid4().hex
+    return st.session_state["_usage_session_id"]
+
+
+def _log_usage(event: str, **details) -> None:
+    if usage_journal is None:
+        return
+    try:
+        usage_journal.write(
+            event,
+            session_id=_session_id(),
+            app_version=APP_VERSION,
+            **details,
+        )
+    except OSError:
+        logger.exception("Unable to write usage event: %s", event)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -274,6 +304,10 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 # ─────────────────────────────────────────────────────────────────
 
 def main():
+    if not st.session_state.get("_usage_session_opened"):
+        _log_usage("session_opened")
+        st.session_state["_usage_session_opened"] = True
+
     render_header()
 
     # ── Загрузка файла ──────────────────────────────────────────
@@ -288,12 +322,31 @@ def main():
         return
 
     # ── Парсинг файла ───────────────────────────────────────────
-    file_bytes = uploaded.read()
+    file_bytes = uploaded.getvalue()
+    file_id = hashlib.sha256(file_bytes).hexdigest()[:12]
+    file_name = Path(uploaded.name).name
     try:
         sheets = load_excel(file_bytes, uploaded.name)
     except Exception as e:
+        _log_usage(
+            "file_load_failed",
+            file_name=file_name,
+            file_id=file_id,
+            file_size_bytes=len(file_bytes),
+            error_type=type(e).__name__,
+        )
         st.error(f"Не удалось прочитать файл: {e}")
         return
+
+    if st.session_state.get("_usage_loaded_file_id") != file_id:
+        _log_usage(
+            "file_loaded",
+            file_name=file_name,
+            file_id=file_id,
+            file_size_bytes=len(file_bytes),
+            sheet_count=len(sheets),
+        )
+        st.session_state["_usage_loaded_file_id"] = file_id
 
     # Выбор листа
     sheet_options = list(sheets.keys())
@@ -345,6 +398,16 @@ def main():
     if run_clicked:
         progress = st.progress(0, text="Запуск…")
         start_t  = time.time()
+        run_id = uuid.uuid4().hex[:12]
+        _log_usage(
+            "processing_started",
+            run_id=run_id,
+            file_name=file_name,
+            file_id=file_id,
+            sheet_name=str(sheet_name),
+            address_column=str(address_col),
+            rows=len(df),
+        )
 
         try:
             result_df = process_dataframe(
@@ -352,22 +415,47 @@ def main():
                 address_col=address_col,
                 progress_bar=progress,
             )
-        except Exception:
+        except Exception as error:
+            _log_usage(
+                "processing_failed",
+                run_id=run_id,
+                file_name=file_name,
+                file_id=file_id,
+                sheet_name=str(sheet_name),
+                rows=len(df),
+                error_type=type(error).__name__,
+            )
             st.error("Ошибка при обработке:\n\n" + traceback.format_exc())
             return
 
         elapsed = time.time() - start_t
         progress.empty()
+        settlement_count = int(result_df[COL_SETTLEMENT].ne("").sum())
+        address_count = int(result_df[COL_HOUSE_STREET].ne("").sum())
+        _log_usage(
+            "processing_completed",
+            run_id=run_id,
+            file_name=file_name,
+            file_id=file_id,
+            sheet_name=str(sheet_name),
+            address_column=str(address_col),
+            rows=len(result_df),
+            settlement_count=settlement_count,
+            address_count=address_count,
+            elapsed_seconds=round(elapsed, 3),
+        )
         st.session_state["result_df"] = result_df
         st.session_state["result_meta"] = {
-            "file_name": uploaded.name,
+            "file_name": file_name,
+            "file_id": file_id,
             "address_col": address_col,
             "elapsed": elapsed,
+            "run_id": run_id,
         }
 
     result_df = st.session_state.get("result_df")
     result_meta = st.session_state.get("result_meta", {})
-    if result_df is not None and result_meta.get("file_name") == uploaded.name:
+    if result_df is not None and result_meta.get("file_id") == file_id:
         elapsed = result_meta.get("elapsed", 0.0)
 
         # Метрики
@@ -398,7 +486,7 @@ def main():
         out_name = uploaded.name.replace(".xlsx", "").replace(".xls", "")
         dl_col, status_col = st.columns([1, 2])
         with dl_col:
-            st.download_button(
+            downloaded = st.download_button(
                 label="Download Excel",
                 data=excel_bytes,
                 file_name=f"{out_name}_адреса.xlsx",
@@ -406,6 +494,17 @@ def main():
                 type="primary",
                 use_container_width=True,
             )
+            if downloaded:
+                download_token = f"{file_id}:{result_meta.get('run_id', '')}"
+                if st.session_state.get("_usage_download_token") != download_token:
+                    _log_usage(
+                        "result_downloaded",
+                        run_id=result_meta.get("run_id", ""),
+                        file_name=file_name,
+                        file_id=file_id,
+                        rows=len(result_df),
+                    )
+                    st.session_state["_usage_download_token"] = download_token
         with status_col:
             st.success(f"✓ Обработано {len(result_df)} строк за {elapsed:.1f} с.")
 
